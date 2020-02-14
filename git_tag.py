@@ -15,6 +15,7 @@ LOG = get_logger(__name__)
 class GitTagSection(StaticSection):
     treelist = ListAttribute('treelist')
     allowed_channels = ListAttribute('allowed_channels')
+    ignore_branches = ListAttribute('ignore_branches')
 
 
 def configure(config):
@@ -65,6 +66,9 @@ def xmlrpc_update(bot):
             branch = head_data[1]
             branch = branch.replace('refs/heads/', '')
             treebranch = "{}#{}".format(name, branch)
+
+            if treebranch in bot.config.git_tag.ignore_branches:
+                continue
 
             if "github.com" in url:
                 github_user, github_project = url.split("/")[3:5]
