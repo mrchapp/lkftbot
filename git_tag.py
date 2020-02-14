@@ -64,13 +64,18 @@ def xmlrpc_update(bot):
             commit = head_data[0]
             branch = head_data[1]
             branch = branch.replace('refs/heads/', '')
-            makefile_url = "{}/plain/Makefile?h={}".format(url, branch)
+            treebranch = "{}#{}".format(name, branch)
+
+            if "github.com" in url:
+                github_user, github_project = url.split("/")[3:5]
+                makefile_url = "https://raw.githubusercontent.com/{}/{}/{}/Makefile".format(github_user, github_project, commit)
+            else:
+                makefile_url = "{}/plain/Makefile?h={}".format(url, commit)
             http = requests.get(makefile_url)
             if http.status_code == 302 or http.status_code == 404:
                 continue
             toplines = http.content.decode('utf-8').split('\n')
             git_tag = get_git_tag(toplines[:6])
-            treebranch = "{}#{}".format(name, branch)
             git_describe = "{} ({})".format(git_tag, commit)
             if treebranch in bot.memory['git_tag']:
                 if bot.memory['git_tag'][treebranch] != git_describe:
