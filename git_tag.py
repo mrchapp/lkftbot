@@ -4,6 +4,7 @@
 
 import requests
 import subprocess
+import sys
 
 from sopel.config.types import StaticSection, ListAttribute
 from sopel.module import interval
@@ -53,53 +54,114 @@ def get_git_tag(text):
     return "v{}.{}.{}{}".format(version, patchlevel, sublevel, extraversion)
 
 
-@interval(180)
+def update_url(bot, url):
+    LOG.info("Updating for %s" % url)
+    ls_data = subprocess.check_output(["git", "ls-remote", url, "refs/heads/*"])
+    ls_data = ls_data.decode("utf-8")
+    ls_data = ls_data.strip()
+
+    for tree in bot.config.git_tag.treelist:
+        t_name, t_url = tree.split("#")
+        if url == t_url:
+            name = t_name
+            break
+
+    for head_data in ls_data.split("\n"):
+        head_data = head_data.split("\t")
+        commit = head_data[0]
+        branch = head_data[1]
+        branch = branch.replace("refs/heads/", "")
+        treebranch = "{}#{}".format(name, branch)
+
+        if treebranch in bot.config.git_tag.ignore_branches:
+            continue
+
+        makefile_url = get_makefile_url(url, commit)
+
+        http = requests.get(makefile_url)
+        if http.status_code == 302 or http.status_code == 404:
+            continue
+        toplines = http.content.decode("utf-8").split("\n")
+        git_tag = get_git_tag(toplines[:6])
+        git_describe = "{} ({})".format(git_tag, commit)
+        if treebranch in bot.memory["git_tag"]:
+            if bot.memory["git_tag"][treebranch] != git_describe:
+                bot_say(bot, "{} has new version {}".format(treebranch, git_describe))
+                bot.memory["git_tag"][treebranch] = git_describe
+            else:
+                LOG.info(
+                    "{} has not changed tag from {}".format(treebranch, git_describe)
+                )
+        else:
+            LOG.info(
+                "no tag record for {}, setting to {}".format(treebranch, git_describe)
+            )
+            bot.memory["git_tag"][treebranch] = git_describe
+
+
+def get_makefile_url(url, commit):
+    if "github.com" in url:
+        github_user, github_project = url.split("/")[3:5]
+        makefile_url = "https://raw.githubusercontent.com/{}/{}/{}/Makefile".format(
+            github_user, github_project, commit
+        )
+    else:
+        makefile_url = "{}/plain/Makefile?h={}".format(url, commit)
+
+    return makefile_url
+
+
+@interval(120)
 def xmlrpc_update(bot):
     if "git_tag" not in bot.memory:
         bot.memory["git_tag"] = {}
+    if "manifest_fingerprints" not in bot.memory:
+        bot.memory["manifest_fingerprints"] = {}
+
+    # Fetch new manifest from git.kernel.org
+    manifest_ret = None
+    try:
+        LOG.info("Fetching kernel.org manifest")
+        manifest_ret = subprocess.call(
+            [
+                "/usr/bin/wget",
+                "-qN",
+                "-P",
+                "/tmp",
+                "https://git.kernel.org/manifest.js.gz",
+            ]
+        )
+    except (FileNotFoundError, CalledProcessError) as e:
+        LOG.info("Error calling on wget. Can't get manifest.js.gz.")
+
+    # Get the fingerprint for
     for tree in bot.config.git_tag.treelist:
-        # bot.memory['git_tag']['updating'] = True
         name, url = tree.split("#")
-        ls_data = subprocess.check_output(["git", "ls-remote", url, "refs/heads/*"])
-        ls_data = ls_data.decode("utf-8")
-        ls_data = ls_data.strip()
-        for head_data in ls_data.split("\n"):
-            head_data = head_data.split("\t")
-            commit = head_data[0]
-            branch = head_data[1]
-            branch = branch.replace("refs/heads/", "")
-            treebranch = "{}#{}".format(name, branch)
-
-            if treebranch in bot.config.git_tag.ignore_branches:
+        if "https://git.kernel.org/" in url:
+            # Did we fetch the manifest?
+            if manifest_ret != 0:
+                LOG.info("Manifest ret != 0")
                 continue
-
-            if "github.com" in url:
-                github_user, github_project = url.split("/")[3:5]
-                makefile_url = "https://raw.githubusercontent.com/{}/{}/{}/Makefile".format(
-                    github_user, github_project, commit
-                )
-            else:
-                makefile_url = "{}/plain/Makefile?h={}".format(url, commit)
-            http = requests.get(makefile_url)
-            if http.status_code == 302 or http.status_code == 404:
-                continue
-            toplines = http.content.decode("utf-8").split("\n")
-            git_tag = get_git_tag(toplines[:6])
-            git_describe = "{} ({})".format(git_tag, commit)
-            if treebranch in bot.memory["git_tag"]:
-                if bot.memory["git_tag"][treebranch] != git_describe:
-                    bot_say(bot, "{} has new tag {}".format(treebranch, git_describe))
-                    bot.memory["git_tag"][treebranch] = git_describe
-                else:
-                    LOG.debug(
-                        "{} has not changed tag from {}".format(
-                            treebranch, git_describe
-                        )
-                    )
-            else:
+            key = url.replace("https://git.kernel.org", "")
+            cmd = """zcat /tmp/manifest.js.gz | jq -r '{"%s"}[] | .fingerprint'""" % key
+            fingerprint = subprocess.check_output(cmd, shell=True).decode().strip()
+            LOG.info("Fingerprint for %s [%s]" % (name, fingerprint))
+            if url in bot.memory["manifest_fingerprints"]:
                 LOG.info(
-                    "no tag record for {}, setting to {}".format(
-                        treebranch, git_describe
-                    )
+                    "Fingerprints in memory for %s: %d"
+                    % (name, len(bot.memory["manifest_fingerprints"]))
                 )
-                bot.memory["git_tag"][treebranch] = git_describe
+                if bot.memory["manifest_fingerprints"][url] != fingerprint:
+                    LOG.info(
+                        "Fingerprint changed for %s: %s (was %s)"
+                        % (url, fingerprint, bot.memory["manifest_fingerprints"][url])
+                    )
+                    update_url(bot, url)
+                    bot.memory["manifest_fingerprints"][url] = fingerprint
+            else:
+                LOG.info("New fingerprint for %s: %s" % (url, fingerprint))
+                bot.memory["manifest_fingerprints"][url] = fingerprint
+                update_url(bot, url)
+        else:
+            LOG.info("Looking at non-git.kernel.org tree")
+            update_url(bot, url)
